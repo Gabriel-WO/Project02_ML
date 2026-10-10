@@ -1,0 +1,5 @@
+,MAE,R2
+Random forest (default),0.278,0.691
+Random forest (tuned),0.25,0.741
+HistGradientBoosting (default),0.305,0.644
+HistGradientBoosting (tuned),0.271,0.709
