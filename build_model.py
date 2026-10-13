@@ -3,7 +3,11 @@ build_model.py - Step 5 of Project02_ML (K-pop video popularity)
 
 1. Scores the app's random forest on the same held-out test set as before.
 2. Saves test-set predictions (used by make_plots.py).
-3. Refits on ALL data and saves model.joblib + model_info.json for app.py.
+3. Measures how wrong the model tends to be at each prediction level, using
+   5-fold out-of-fold predictions, so the app can show an honest 80% range.
+4. Refits on ALL data and saves model.joblib + model_info.json for app.py,
+   including each channel's upload history (so the app can look up a
+   channel's record AS OF any release date).
 
 The app model is a smaller forest than the 355 MB one from tune_models.py
 (min_samples_leaf=5, 100 trees, max_features=0.33), so the file is ~23 MB and
@@ -19,12 +23,12 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, cross_val_predict, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-df = pd.read_csv("kpop_videos_clean.csv", parse_dates=["published_at"])
-df = df.dropna(subset=["prev_avg_log_vpd"])
+full = pd.read_csv("kpop_videos_clean.csv", parse_dates=["published_at"])
+df = full.dropna(subset=["prev_avg_log_vpd"]).copy()
 df["log_days_since_release"] = np.log10(df["days_since_release"])
 
 CATEGORICAL = ["video_type", "channel"]
@@ -67,26 +71,57 @@ grouped = imp.groupby(lambda n: "channel" if n.startswith("cat__channel")
                       else n.split("__")[1]).sum().sort_values(ascending=False)
 grouped.to_csv("feature_importance.csv", header=["importance"])
 
-# 3. Refit on all data for the app
+# 3. Honest prediction ranges.
+#    A random forest pulls big hits toward the middle, so errors are NOT the
+#    same size everywhere: videos predicted to be large are usually
+#    underpredicted. We record the 10th/90th percentile of the error
+#    (actual minus predicted, in log10) for each prediction level, using
+#    out-of-fold predictions so every video is scored by a model that never
+#    saw it. The app turns these into an 80% range.
+oof = cross_val_predict(make_model(), df[COLS], df[TARGET],
+                        cv=KFold(5, shuffle=True, random_state=0))
+resid = df[TARGET].values - oof
+edges = np.quantile(oof, [0.2, 0.4, 0.6, 0.8, 0.95, 0.99])
+bin_id = np.digitize(oof, edges)
+range_bins = {"edges": [round(float(e), 4) for e in edges], "q10": [], "q90": []}
+print("\nHow far off is the model, by predicted level? (80% of actual views land in this multiple of the prediction)")
+for b in range(len(edges) + 1):
+    lo, hi = np.quantile(resid[bin_id == b], [0.1, 0.9])
+    range_bins["q10"].append(round(float(lo), 4))
+    range_bins["q90"].append(round(float(hi), 4))
+    typical = 10 ** np.median(oof[bin_id == b])
+    print(f"  predicted about {typical:>13,.0f} views (n={int((bin_id == b).sum()):>5}): "
+          f"x{10 ** lo:.2f} to x{10 ** hi:.2f}")
+
+# 4. Refit on all data for the app
 final = make_model().fit(df[COLS], df[TARGET])
 joblib.dump(final, "model.joblib", compress=3)
 
-# Per-channel facts the app uses to fill in "history" features automatically
-channels = {}
-for ch, g in df.sort_values("published_at").groupby("channel"):
+# Per-channel facts for the app. "history" lets the app compute, for any
+# release date, how many videos the channel had uploaded before it and their
+# average views per day, matching how the training features were built.
+epoch = pd.Timestamp("1970-01-01", tz="UTC")
+channels, history = {}, {}
+for ch, g in full.sort_values("published_at").groupby("channel"):
     channels[ch] = {
         "video_count": int(len(g)),
         "avg_log_vpd": float(g["log_views_per_day"].mean()),
         "median_duration": float(g["duration_sec"].median()),
     }
+    history[ch] = {
+        "t_hours": ((g["published_at"] - epoch) // pd.Timedelta(hours=1)).astype(int).tolist(),
+        "cum_lvpd": np.round(np.cumsum(g["log_views_per_day"].values), 4).tolist(),
+    }
 info = {
     "channels": channels,
+    "history": history,
     "video_types": sorted(df["video_type"].unique().tolist()),
+    "range_bins": range_bins,
     "test_mae": round(mae, 3),
     "test_r2": round(r2, 3),
     "min_age_days": 1,
     "max_age_days": int(df["days_since_release"].max()),
 }
 with open("model_info.json", "w") as f:
-    json.dump(info, f, indent=2)
-print("saved model.joblib, model_info.json, test_predictions.csv, feature_importance.csv")
+    json.dump(info, f)
+print("\nsaved model.joblib, model_info.json, test_predictions.csv, feature_importance.csv")

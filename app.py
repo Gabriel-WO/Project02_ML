@@ -30,6 +30,18 @@ def _running_in_streamlit():
         return False
 
 
+def _model_is_current():
+    """True if model.joblib and a model_info.json from the current build_model.py exist."""
+    import json
+    try:
+        with open(os.path.join(HERE, "model_info.json")) as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return (os.path.exists(os.path.join(HERE, "model.joblib"))
+            and "range_bins" in info and "history" in info)
+
+
 def _launch():
     """Start the Streamlit server for this file in-process and open the browser."""
     import runpy
@@ -47,13 +59,17 @@ def _launch():
 
     os.chdir(HERE)  # so model.joblib / CSV files are found whatever the run config says
 
-    if not (os.path.exists("model.joblib") and os.path.exists("model_info.json")):
-        print("First run: training the model (about a minute)...", flush=True)
+    if not _model_is_current():
+        print("Training the model (about a minute)...", flush=True)
         runpy.run_path(os.path.join(HERE, "build_model.py"), run_name="__main__")
 
     # Prefer Streamlit's usual port; fall back to any free one if it is busy.
     port = 8501
     with socket.socket() as s:
+        if os.name != "nt":
+            # Without this, a server that was just stopped can leave the port
+            # "in use" for a minute and we would pick a different one each time.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("localhost", port))
         except OSError:
@@ -89,6 +105,7 @@ if __name__ == "__main__" and not _running_in_streamlit():
 # ---------------------------------------------------------------------------
 # The app itself (only reached when Streamlit is running this file)
 # ---------------------------------------------------------------------------
+import bisect
 import datetime as dt
 import json
 
@@ -117,8 +134,15 @@ if not (os.path.exists(MODEL_PATH) and os.path.exists(INFO_PATH)):
     st.stop()
 
 model, info = load()
+if "range_bins" not in info or "history" not in info:
+    st.error("model_info.json is from an older version of build_model.py. Delete model.joblib and "
+             "model_info.json, then run `python build_model.py` and reload this page.")
+    st.stop()
 channels = info["channels"]
+history = info.get("history", {})
+range_bins = info["range_bins"]
 MAE = info["test_mae"]  # typical error on the log10 scale
+EPOCH = dt.datetime(1970, 1, 1)
 
 
 def fmt(n):
@@ -129,9 +153,19 @@ def fmt(n):
     return f"{n:,.0f}"
 
 
-def make_row(channel, video_type, release, hour, duration, title, age_days):
+def channel_record(channel, release_dt):
+    """The channel's upload count and average views/day for videos published BEFORE
+    release_dt. This matches how the training features were built."""
+    h = history[channel]
+    hours = (release_dt - EPOCH).total_seconds() / 3600
+    n = bisect.bisect_left(h["t_hours"], hours)
+    if n == 0:  # nothing earlier in the data: fall back to the whole-channel average
+        return channels[channel]["video_count"], channels[channel]["avg_log_vpd"], False
+    return n, h["cum_lvpd"][n - 1] / n, True
+
+
+def make_row(channel, video_type, release, hour, duration, title, age_days, prev_count, prev_avg):
     """Build one model input row from what the user typed."""
-    ch = channels[channel]
     return pd.DataFrame([{
         "video_type": video_type,
         "channel": channel,
@@ -144,10 +178,16 @@ def make_row(channel, video_type, release, hour, duration, title, age_days):
         "title_has_english": int(any(c.isascii() and c.isalpha() for c in title)),
         "title_length": len(title),
         "n_hashtags": title.count("#"),
-        "prev_video_count": ch["video_count"],
-        "prev_avg_log_vpd": ch["avg_log_vpd"],
+        "prev_video_count": prev_count,
+        "prev_avg_log_vpd": prev_avg,
         "log_days_since_release": np.log10(max(age_days, 1)),
     }])
+
+
+def prediction_range(pred_log):
+    """80% range, widened where the model is known to be less accurate."""
+    b = int(np.digitize(pred_log, range_bins["edges"]))
+    return 10 ** (pred_log + range_bins["q10"][b]), 10 ** (pred_log + range_bins["q90"][b])
 
 
 st.title("🎤 K-pop YouTube View Predictor")
@@ -158,6 +198,7 @@ st.caption(
 )
 
 left, right = st.columns([1, 1.4], gap="large")
+today = dt.date.today()
 
 with left:
     st.subheader("Describe the video")
@@ -172,33 +213,49 @@ with left:
     title = st.text_input("Video title", "ARTIST 'Song Name' Official MV #KPOP",
                           help="Length, hashtags, and Korean/English text are used as features.")
     c1, c2 = st.columns(2)
-    release = c1.date_input("Release date", dt.date.today())
+    release = c1.date_input("Release date", today,
+                            min_value=dt.date(2009, 1, 1), max_value=dt.date(2030, 12, 31))
     hour = c2.slider("Release hour (UTC)", 0, 23, 9)
     duration = st.slider("Video length (seconds)", 10, 600,
                          int(min(max(channels[channel]["median_duration"], 10), 600)))
-    age = st.slider("Predict views after this many days", 1, 1095, 30,
-                    help="Total views keep growing as a video ages.")
-    st.info(
-        f"{channel.lstrip('@')} has {channels[channel]['video_count']:,} videos in the data and "
-        f"averages about {fmt(10 ** channels[channel]['avg_log_vpd'])} views per day. "
-        "The model fills these in automatically."
-    )
 
-row = make_row(channel, video_type, release, hour, duration, title, age)
+    mode = st.radio("Predict views", ["As of today", "After a set number of days"],
+                    index=0 if release < today else 1, horizontal=True,
+                    help="'As of today' counts the days from the release date to today, "
+                         "so use it for videos that are already out.")
+    if mode == "As of today":
+        age = max((today - release).days, 1)
+        st.caption(f"Video age: {age:,} days")
+    else:
+        age = st.slider("Days after release", 1, 3650, 30)
+
+    release_dt = dt.datetime.combine(release, dt.time(hour))
+    prev_count, prev_avg, found = channel_record(channel, release_dt)
+    note = (f"Before this release date, {channel.lstrip('@')} had {prev_count:,} videos in the data "
+            f"averaging about {fmt(10 ** prev_avg)} views per day."
+            if found else
+            f"{channel.lstrip('@')} has no earlier videos in the data before this date, so its "
+            f"overall average ({fmt(10 ** prev_avg)} views per day) is used.")
+    st.info(note + " The model fills these in automatically.")
+
+row = make_row(channel, video_type, release, hour, duration, title, age, prev_count, prev_avg)
 pred_log = float(model.predict(row)[0])
 pred = 10 ** pred_log
-low, high = 10 ** (pred_log - MAE), 10 ** (pred_log + MAE)
+low, high = prediction_range(pred_log)
 
 with right:
     st.subheader("Prediction")
     m1, m2 = st.columns(2)
-    m1.metric(f"Total views after {age} day{'s' if age != 1 else ''}", fmt(pred))
-    m2.metric("Likely range", f"{fmt(low)} to {fmt(high)}",
-              help="Plus or minus one typical test-set error on the log scale.")
+    m1.metric(f"Total views after {age:,} day{'s' if age != 1 else ''}", fmt(pred))
+    m2.metric("Likely range (80%)", f"{fmt(low)} to {fmt(high)}",
+              help="Built from the model's actual errors at this prediction level in testing. "
+                   "The range is lopsided because the model tends to underpredict big hits. "
+                   "Real blockbusters can still land above it.")
 
     # How predicted views grow with age
-    ages = np.unique(np.round(np.logspace(0, np.log10(1095), 40)).astype(int))
-    curve = pd.concat([make_row(channel, video_type, release, hour, duration, title, a) for a in ages])
+    ages = np.unique(np.round(np.logspace(0, np.log10(max(3650, age)), 40)).astype(int))
+    curve = pd.concat([make_row(channel, video_type, release, hour, duration, title, a,
+                                prev_count, prev_avg) for a in ages])
     curve_df = pd.DataFrame({"days": ages, "views": 10 ** model.predict(curve)})
     line = alt.Chart(curve_df).mark_line(strokeWidth=2.5, color="#2a78d6").encode(
         x=alt.X("days:Q", title="Days since release", scale=alt.Scale(type="log")),
@@ -213,14 +270,14 @@ with right:
     st.altair_chart((line + dot).properties(height=320), use_container_width=True)
 
     st.subheader("Compare video types for this artist")
-    types = pd.concat([make_row(channel, t, release, hour, duration, title, age)
+    types = pd.concat([make_row(channel, t, release, hour, duration, title, age, prev_count, prev_avg)
                        for t in info["video_types"]])
     cmp_df = pd.DataFrame({
         "type": [t.replace("_", " ") for t in info["video_types"]],
         "views": 10 ** model.predict(types),
     }).sort_values("views", ascending=False)
     bars = alt.Chart(cmp_df).mark_bar(color="#2a78d6", cornerRadiusEnd=4).encode(
-        x=alt.X("views:Q", title=f"Predicted views after {age} days", axis=alt.Axis(format="~s")),
+        x=alt.X("views:Q", title=f"Predicted views after {age:,} days", axis=alt.Axis(format="~s")),
         y=alt.Y("type:N", sort="-x", title=None),
         tooltip=[alt.Tooltip("type:N"), alt.Tooltip("views:Q", format=",.0f")],
     )
@@ -230,8 +287,11 @@ with st.expander("Limitations (read before trusting a number)"):
     st.markdown(
         f"- The model learned from **already released videos from {len(channels)} official channels**, so it "
         "works best for artists in that list.\n"
-        "- A brand-new group has no channel history. The model cannot capture hype, "
-        "pre-orders, or marketing.\n"
+        "- **Mega-hits are badly underpredicted.** In testing, videos with over 100M views came out about "
+        "10x too low on average. Only a few dozen videos in the data are that big, and the model cannot "
+        "see hype, fan-base size, or marketing. For a major group's music video, treat the top of the "
+        "range as the realistic number.\n"
+        "- A brand-new group has no channel history for the model to use.\n"
         "- Predictions for the first few days are the least reliable, because few training "
         "videos were that young when the data was pulled.\n"
         "- The score comes from a random train/test split, which is lenient. Expect worse "

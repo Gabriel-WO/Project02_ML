@@ -16,7 +16,7 @@ import re
 import numpy as np
 import pandas as pd
 
-RAW = "kpop_videos_raw.csv"
+RAW = "kpop_videos_merged.csv"
 OUT = "kpop_videos_clean.csv"
 PULL_DATE = pd.Timestamp("2026-10-06", tz="UTC")  # day the API data was pulled
 
