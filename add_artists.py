@@ -22,7 +22,7 @@ host shows, competitions and documentaries, so ONLY artists on the approved list
 artist_candidates.csv, add any real artists to KNOWN_ARTISTS, and re-run. Fix split
 or misspelled names (e.g. "NCT 127" vs "NCT127") with a line in ALIASES.
 
-AI assistance: drafted with Claude (document this in the README).
+AI assistance: drafted with Claude.
 """
 import re
 import sys
