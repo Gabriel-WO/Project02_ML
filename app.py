@@ -13,7 +13,7 @@ How to open it:
 If model.joblib does not exist yet, the first run trains it automatically
 by running build_model.py (takes about a minute).
 
-AI assistance: drafted with Claude (document this in the README).
+AI assistance: https://claude.ai/share/7f405ba6-86b2-4be1-9a15-8630bd38b19a.
 """
 import os
 import sys
