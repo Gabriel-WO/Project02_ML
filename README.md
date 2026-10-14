@@ -1,8 +1,6 @@
-## Project 02 - Machine Learning
+## Project 02 Machine Learning - K-Pop View Predictor
 ### Overview
 This is a machine learning project that uses YouTube API data (pulled 10.06.2026) to predict view counts for K-Pop videos from a variety of artists, including TWICE, BTS, Blackpink, and more. The model uses a random forest of 100 trees to predict views; the prediction is the average of all the tree outputs. 
-
-Claude was used to help write code. 
 
 ### Files
 * add_artists.py - merges data from pulled artists and label channels (which often jointly publish videos with the official group channel). 
@@ -33,3 +31,6 @@ YouTube API data doesn't show anything about the songs themselves. Variables lik
 Because the data only pulls from major K-Pop groups, the amount of music videos in particular is quite small, so the model struggles with estimating view counts for music videos. For mega-hits (with 200+ million views) the upper limit that the model gives is often closer to the actual view count. 
 
 By taking the average of the random forest, extreme values are pulled towards the middle, causing the top fifth most viewed videos to be  underestimated. 
+
+### AI assistance
+Claude was used to write code and create UI. 
